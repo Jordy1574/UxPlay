@@ -377,7 +377,10 @@ static uint32_t mdns_get_default_ipv4(void)
                 wcsstr(pCurr->Description, L"Hyper-V") == NULL &&
                 wcsstr(pCurr->Description, L"Virtual") == NULL &&
                 wcsstr(pCurr->Description, L"WSL") == NULL &&
-                wcsstr(pCurr->Description, L"vEthernet") == NULL) {
+                wcsstr(pCurr->Description, L"vEthernet") == NULL &&
+                wcsstr(pCurr->Description, L"WireGuard") == NULL &&
+                wcsstr(pCurr->Description, L"VPN") == NULL &&
+                wcsstr(pCurr->Description, L"TAP-") == NULL) {
                 
                 if (pCurr->FirstUnicastAddress != NULL) {
                     struct sockaddr_in *sockaddr_ipv4 = (struct sockaddr_in *)pCurr->FirstUnicastAddress->Address.lpSockaddr;

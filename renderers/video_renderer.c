@@ -56,6 +56,17 @@ static bool alt_keypress = false;
 static unsigned char X11_search_attempts = 0;
 #endif
 
+#if defined(_WIN32) && !defined(X_DISPLAY_FIX)
+#include <windows.h>
+#include <gst/video/navigation.h>
+/* Ctrl + mouse wheel zoom: crop the decoded video around the mouse pointer */
+static double zoom_level = 1.0;
+static int zoom_src_w = 0;
+static int zoom_src_h = 0;
+static double zoom_x = 0.0;   /* top-left corner of visible region, in source pixels */
+static double zoom_y = 0.0;
+#endif
+
 static GstClockTime gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
 static logger_t *logger = NULL;
 static bool first_packet = false;
@@ -390,6 +401,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             if (!rtp || jpeg_pipeline) {
                 g_string_append(launch, " ! ");
                 append_videoflip(launch, &videoflip[0], &videoflip[1]);
+#if defined(_WIN32) && !defined(X_DISPLAY_FIX)
+                if (!jpeg_pipeline) {
+                    g_string_append(launch, "videocrop name=zoom_crop ! ");
+                }
+#endif
                 g_string_append(launch, converter);
                 g_string_append(launch, " ! ");
                 g_string_append(launch, "videoscale ! ");
@@ -836,6 +852,82 @@ static void hls_video_seek_to_start_position(GstElement *pipeline) {
     } 
 }
 
+#if defined(_WIN32) && !defined(X_DISPLAY_FIX)
+static gboolean get_pad_video_size(GstElement *element, int *width, int *height) {
+    gboolean ret = FALSE;
+    GstPad *pad = gst_element_get_static_pad(element, "sink");
+    if (pad) {
+        GstCaps *caps = gst_pad_get_current_caps(pad);
+        if (caps) {
+            GstStructure *s = gst_caps_get_structure(caps, 0);
+            ret = gst_structure_get_int(s, "width", width) && gst_structure_get_int(s, "height", height);
+            gst_caps_unref(caps);
+        }
+        gst_object_unref(pad);
+    }
+    return ret;
+}
+
+/* F11 / double-click toggle fullscreen, Esc only leaves it */
+static void toggle_fullscreen(GstElement *videosink, gboolean exit_only) {
+    gboolean is_fullscreen = FALSE;
+    if (!g_object_class_find_property(G_OBJECT_GET_CLASS(videosink), "fullscreen")) {
+        return;
+    }
+    g_object_get(videosink, "fullscreen", &is_fullscreen, NULL);
+    if (exit_only && !is_fullscreen) {
+        return;
+    }
+    g_object_set(videosink, "fullscreen", !is_fullscreen, NULL);
+}
+
+/* (x,y) is the pointer position in the videosink's video coordinates; delta > 0 zooms in */
+static void video_zoom(GstElement *videosink, gdouble x, gdouble y, gdouble delta) {
+    int src_w, src_h, view_w, view_h;
+    GstElement *crop = gst_bin_get_by_name(GST_BIN(renderer->pipeline), "zoom_crop");
+    if (!crop) {
+        return;
+    }
+    if (!get_pad_video_size(crop, &src_w, &src_h) || !get_pad_video_size(videosink, &view_w, &view_h)) {
+        gst_object_unref(crop);
+        return;
+    }
+    if (src_w != zoom_src_w || src_h != zoom_src_h) {
+        /* new stream geometry: start unzoomed */
+        zoom_level = 1.0;
+        zoom_x = zoom_y = 0.0;
+        zoom_src_w = src_w;
+        zoom_src_h = src_h;
+    }
+    double fx = CLAMP(x / view_w, 0.0, 1.0);
+    double fy = CLAMP(y / view_h, 0.0, 1.0);
+    /* keep the source point under the pointer fixed while zooming */
+    double px = zoom_x + fx * (src_w / zoom_level);
+    double py = zoom_y + fy * (src_h / zoom_level);
+    zoom_level *= (delta > 0 ? 1.1 : 1.0 / 1.1);
+    zoom_level = CLAMP(zoom_level, 1.0, 8.0);
+    if (zoom_level < 1.01) {
+        zoom_level = 1.0;
+    }
+    double new_w = src_w / zoom_level;
+    double new_h = src_h / zoom_level;
+    zoom_x = CLAMP(px - fx * new_w, 0.0, src_w - new_w);
+    zoom_y = CLAMP(py - fy * new_h, 0.0, src_h - new_h);
+    /* even values keep chroma-subsampled formats aligned */
+    int left = ((int) zoom_x) & ~1;
+    int top = ((int) zoom_y) & ~1;
+    int right = MAX(0, (src_w - left - ((int) new_w & ~1)) & ~1);
+    int bottom = MAX(0, (src_h - top - ((int) new_h & ~1)) & ~1);
+    if (zoom_level == 1.0) {
+        left = top = right = bottom = 0;
+    }
+    logger_log(logger, LOGGER_DEBUG, "zoom %.2f: crop left=%d right=%d top=%d bottom=%d (source %dx%d)",
+               zoom_level, left, right, top, bottom, src_w, src_h);
+    g_object_set(crop, "left", left, "right", right, "top", top, "bottom", bottom, NULL);
+    gst_object_unref(crop);
+}
+#endif
+
 static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
     GstState old_state, new_state;
     const gchar no_state[] = "";
@@ -1058,6 +1150,41 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
                 if (event) {
                     gst_event_unref (event);
                 }
+            }
+        }
+        break;
+#endif
+#if defined(_WIN32) && !defined(X_DISPLAY_FIX)
+    case GST_MESSAGE_ELEMENT:
+        if (gst_navigation_message_get_type (message) == GST_NAVIGATION_MESSAGE_EVENT) {
+            GstEvent *event = NULL;
+            if (gst_navigation_message_parse_event (message, &event)) {
+                gdouble x, y, dx, dy;
+                gint button;
+                const gchar *key = NULL;
+                GstNavigationModifierType state = GST_NAVIGATION_MODIFIER_NONE;
+                GstElement *videosink = GST_ELEMENT(GST_MESSAGE_SRC(message));
+                if (gst_navigation_event_get_type (event) == GST_NAVIGATION_EVENT_KEY_PRESS &&
+                    gst_navigation_event_parse_key_event (event, &key)) {
+                    logger_log(logger, LOGGER_DEBUG, "video window key press: %s", key);
+                    if (!g_ascii_strcasecmp (key, "F11")) {
+                        toggle_fullscreen(videosink, FALSE);
+                    } else if (!g_ascii_strcasecmp (key, "Esc") || !g_ascii_strcasecmp (key, "Escape")) {
+                        toggle_fullscreen(videosink, TRUE);
+                    }
+                } else if (gst_navigation_event_get_type (event) == GST_NAVIGATION_EVENT_MOUSE_DOUBLE_CLICK &&
+                           gst_navigation_event_parse_mouse_button_event (event, &button, &x, &y) && button == 1) {
+                    toggle_fullscreen(videosink, FALSE);
+                } else if (gst_navigation_event_get_type (event) == GST_NAVIGATION_EVENT_MOUSE_SCROLL &&
+                    gst_navigation_event_parse_mouse_scroll_event (event, &x, &y, &dx, &dy) && dy != 0) {
+                    gst_navigation_event_parse_modifier_state (event, &state);
+                    if ((state & GST_NAVIGATION_MODIFIER_CONTROL_MASK) || (GetAsyncKeyState(VK_CONTROL) & 0x8000)) {
+                        video_zoom(videosink, x, y, dy);
+                    }
+                }
+            }
+            if (event) {
+                gst_event_unref (event);
             }
         }
         break;
